@@ -1,0 +1,10 @@
+[package]
+name = "computer-control"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.24.1"
+egui = "0.24.1"
+cpal = "0.15"
+whisper-rs = "0.14"
