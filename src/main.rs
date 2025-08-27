@@ -6,11 +6,15 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use eframe::egui;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use tokio::runtime::Builder as TokioRtBuilder;
+
+mod llm;
+use llm::{ChatMessage, LlmClient, LlmConfig, Role};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 260.0])
+            .with_inner_size([500.0, 460.0])
             .with_title("Voice Control"),
         ..Default::default()
     };
@@ -20,6 +24,77 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|_cc| Box::new(App::default())),
     )
+}
+
+impl App {
+    fn start_llm_request(&mut self) {
+        if self.llm_busy {
+            return;
+        }
+        // Reset output
+        self.llm_response.clear();
+        if let Ok(mut q) = self.pending_llm_deltas.lock() { q.clear(); }
+        self.pending_llm_done.store(false, Ordering::Relaxed);
+        self.llm_busy = true;
+        self.status = if self.use_streaming { "LLM (streaming)…".to_string() } else { "LLM…".to_string() };
+
+        let transcript = self.transcript.clone();
+        let streaming = self.use_streaming;
+        let deltas = self.pending_llm_deltas.clone();
+        let done = self.pending_llm_done.clone();
+
+        thread::spawn(move || {
+            // Build client/config from env each request to remain provider-agnostic
+            // Clone for runtime creation error branch
+            let deltas_err = deltas.clone();
+            let done_err = done.clone();
+
+            let run = || async move {
+                let cfg = match LlmConfig::from_env() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if let Ok(mut q) = deltas.lock() { q.push(format!("[error] {e}")); }
+                        done.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                };
+                let client = match LlmClient::new(cfg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if let Ok(mut q) = deltas.lock() { q.push(format!("[error] {e}")); }
+                        done.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                };
+
+                let messages = vec![ChatMessage { role: Role::User, content: transcript }];
+
+                if streaming {
+                    let _ = client.send_stream(&messages, |delta| {
+                        if let Ok(mut q) = deltas.lock() { q.push(delta.to_string()); }
+                    }).await.map_err(|e| {
+                        if let Ok(mut q) = deltas.lock() { q.push(format!("[error] {e}")); }
+                    });
+                } else {
+                    match client.send(&messages).await {
+                        Ok(full) => { if let Ok(mut q) = deltas.lock() { q.push(full); } }
+                        Err(e) => { if let Ok(mut q) = deltas.lock() { q.push(format!("[error] {e}")); } }
+                    }
+                }
+                done.store(true, Ordering::Relaxed);
+            };
+
+            // Run the async block on a fresh multi-threaded runtime
+            let rt = TokioRtBuilder::new_multi_thread().enable_all().build();
+            match rt {
+                Ok(rt) => { rt.block_on(run()); }
+                Err(e) => {
+                    if let Ok(mut q) = deltas_err.lock() { q.push(format!("[error] tokio rt: {e}")); }
+                    done_err.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
 }
 
 #[derive(Default)]
@@ -38,6 +113,14 @@ struct App {
     transcribing: bool,
     transcript: String,
     pending_transcript: Arc<Mutex<Option<String>>>,
+    // LLM state
+    use_streaming: bool,
+    llm_busy: bool,
+    llm_response: String,
+    pending_llm_deltas: Arc<Mutex<Vec<String>>>,
+    pending_llm_done: Arc<AtomicBool>,
+    // optional cached client (rebuilt per request if env changes)
+    llm_client: Option<LlmClient>,
 }
 
 impl App {
@@ -120,7 +203,7 @@ impl eframe::App for App {
 
             // Status row with optional spinner
             ui.horizontal(|ui| {
-                if self.ptt_active || self.transcribing {
+                if self.ptt_active || self.transcribing || self.llm_busy {
                     ui.add(egui::widgets::Spinner::new());
                 }
                 ui.label(if self.status.is_empty() { "Ready" } else { &self.status });
@@ -155,16 +238,49 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label(&self.transcript);
             }
+
+            ui.add_space(12.0);
+            ui.checkbox(&mut self.use_streaming, "Stream LLM reply");
+
+            ui.add_space(8.0);
+            if !self.llm_response.is_empty() || self.llm_busy {
+                ui.label("LLM Response:");
+                ui.separator();
+                ui.label(&self.llm_response);
+            }
         });
 
         // Drain pending transcript from worker thread
         if self.transcribing {
+            // Take the transcript out while holding the lock, then drop the guard
+            let mut taken: Option<String> = None;
             if let Ok(mut p) = self.pending_transcript.lock() {
-                if let Some(text) = p.take() {
-                    self.transcribing = false;
-                    self.transcript = text;
-                    self.status = "Ready".to_string();
+                taken = p.take();
+            }
+            if let Some(text) = taken {
+                self.transcribing = false;
+                self.transcript = text;
+                self.status = "Ready".to_string();
+                // Automatically send to LLM when a new transcript arrives
+                if !self.transcript.is_empty() {
+                    self.start_llm_request();
                 }
+            }
+        }
+
+        // Drain streaming LLM deltas
+        if self.llm_busy {
+            if let Ok(mut q) = self.pending_llm_deltas.lock() {
+                if !q.is_empty() {
+                    for chunk in q.drain(..) {
+                        self.llm_response.push_str(&chunk);
+                    }
+                }
+            }
+            if self.pending_llm_done.load(Ordering::Relaxed) {
+                self.pending_llm_done.store(false, Ordering::Relaxed);
+                self.llm_busy = false;
+                self.status = "Ready".to_string();
             }
         }
     }
