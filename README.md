@@ -1,6 +1,6 @@
-🌐 Orby – Your AI That Gets Things Done
+🌐 Orby - Your AI That Gets Things Done
 
-Orby isn’t just another chatbot—it’s your personal AI operator. Powered by cutting-edge LLMs, Orby can listen, understand, and act on your requests. From running commands and managing files to automating tasks and integrating with your tools, Orby works like a true digital co-pilot.
+Orby isn’t just another chatbot it’s your personal AI operator. Powered by cutting-edge LLMs, Orby can listen, understand, and act on your requests. From running commands and managing files to automating tasks and integrating with your tools, Orby works like a true digital co-pilot.
 
 ✨ What Orby Can Do
 
